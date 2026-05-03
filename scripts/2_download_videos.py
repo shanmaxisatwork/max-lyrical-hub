@@ -86,7 +86,17 @@ def download_video(video_id, title):
             print(f"  streams downloaded, merging...")
 
     ydl_opts = {
-        "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+        # Very flexible format: tries many combinations, always falls back to best available
+        "format": (
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"  # 1080p mp4 + m4a
+            "bestvideo[height<=1080][ext=mp4]+bestaudio/"           # 1080p mp4 + any audio
+            "bestvideo[height<=1080]+bestaudio[ext=m4a]/"           # 1080p any + m4a
+            "bestvideo[height<=1080]+bestaudio/"                    # 1080p any + any audio
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"               # best mp4 + m4a
+            "bestvideo+bestaudio/"                                  # best video + best audio
+            "best[ext=mp4]/"                                        # best single mp4 file
+            "best"                                                   # absolute fallback
+        ),
         "outtmpl": out,
         "merge_output_format": "mp4",
         "progress_hooks": [progress_hook],
