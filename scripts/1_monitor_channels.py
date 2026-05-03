@@ -257,11 +257,19 @@ def main():
 
     telegram(f"🔍 <b>Max Lyrical Hub Bot Started</b>\n⏰ {now_str}\nScanning {len(CHANNEL_HANDLES)} channels for new videos...")
 
-    # Load seen videos state
+    # Load seen videos state — force dict type (corrupt cache can load as list)
     seen = load_json(STATE_FILE, {})
-    # Load existing queue (don't re-add already queued)
+    if not isinstance(seen, dict):
+        print("  [WARN] seen_videos.json corrupted, resetting to empty dict")
+        seen = {}
+
+    # Load existing queue — force list type
     existing_queue = load_json(QUEUE_FILE, [])
-    queued_ids = {v["id"] for v in existing_queue}
+    if not isinstance(existing_queue, list):
+        print("  [WARN] download_queue.json corrupted, resetting to empty list")
+        existing_queue = []
+
+    queued_ids = {v["id"] for v in existing_queue if isinstance(v, dict) and "id" in v}
 
     all_new_videos = []
 
