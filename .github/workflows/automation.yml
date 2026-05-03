@@ -104,7 +104,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install requests google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+          pip install requests yt-dlp google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
 
       - name: Install FFmpeg
         run: |
