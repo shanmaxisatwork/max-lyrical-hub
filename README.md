@@ -162,4 +162,3 @@ max-lyrical-hub/
 - GitHub Actions free tier: 2,000 minutes/month — enough for daily runs
 - Videos are **scheduled** as private first, then auto-publish at peak times
 - The bot respects YouTube's Terms of Service — only downloads public content
-"# max-lyrical-hub" 
