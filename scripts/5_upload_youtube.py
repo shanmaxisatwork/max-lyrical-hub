@@ -36,7 +36,7 @@ UPLOAD_SCHEDULE_UTC = [
 def telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, #parse_mode removed - breaks with special chars}, timeout=10)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         print(f"  [TELEGRAM ERROR] {e}")
 
