@@ -196,56 +196,103 @@ async def download_video_playwright(yt_url, video_id, title):
             print(f"  🔍 Looking for quality/download buttons...")
             await page.wait_for_timeout(3000)
 
-            # ── Step 4: Select best quality download button ──
-            # The button has class "btn-success" and data-fquality attribute
-            # We want the highest quality: prefer 1080p, fallback to best available
+            # ── Step 4: Select best quality MP4 button ──
+            # CONFIRMED from HTML inspection:
+            # - Buttons: button.btn.w-100.btn-success with data-ftype="mp4"
+            # - data-fquality is INTERNAL CODEC ID (not resolution number!)
+            # - Quality text "1080p" is in the PARENT <tr> row text, not the button
+            # Strategy: use JS to scan all mp4 buttons, read parent row for quality label
 
             best_btn = None
-            best_quality = 0
-            quality_priority = ["2160", "1440", "1080", "720", "480", "360"]
 
-            # Try to find quality buttons by data-fquality attribute
-            for quality in quality_priority:
-                try:
-                    btn = page.locator(f"button[data-fquality='{quality}'][data-ftype='mp4']").first
-                    if await btn.is_visible(timeout=2000):
-                        best_btn = btn
-                        print(f"    Found quality button: {quality}p MP4")
-                        break
-                except:
-                    continue
+            print(f"    Scanning MP4 buttons via JS parent-row quality detection...")
 
-            # Fallback: find all btn-success buttons and pick by quality text
+            # JS: find index of best quality mp4 button by reading parent row text
+            js_code = """() => {
+                const qualityOrder = ['2160', '1440', '1080', '720', '480', '360'];
+                const buttons = Array.from(document.querySelectorAll('button[data-ftype="mp4"]'));
+                console.log('mp4 buttons found: ' + buttons.length);
+                if (buttons.length === 0) return {idx: -1, quality: 'none', total: 0};
+
+                let bestIdx = 0;
+                let bestRank = 999;
+
+                buttons.forEach((btn, i) => {
+                    const row = btn.closest('tr') || btn.closest('div') || btn.parentElement;
+                    const txt = row ? row.innerText : '';
+                    for (let r = 0; r < qualityOrder.length; r++) {
+                        if (txt.includes(qualityOrder[r] + 'p')) {
+                            if (r < bestRank) {
+                                bestRank = r;
+                                bestIdx = i;
+                            }
+                            break;
+                        }
+                    }
+                });
+
+                const chosenRow = buttons[bestIdx].closest('tr') || buttons[bestIdx].parentElement;
+                return {
+                    idx: bestIdx,
+                    quality: chosenRow ? chosenRow.innerText.substring(0,40) : 'unknown',
+                    total: buttons.length
+                };
+            }"""
+
+            result = await page.evaluate(js_code)
+            print(f"    JS result: {result}")
+
+            if result and result.get('total', 0) > 0:
+                idx = result.get('idx', 0)
+                quality_label = result.get('quality', '?')
+                all_mp4 = page.locator('button[data-ftype="mp4"]')
+                total = await all_mp4.count()
+                idx = min(idx, total - 1)
+                best_btn = all_mp4.nth(idx)
+                print(f"    Selected MP4 button #{idx} | Row: {quality_label[:40]}")
+
+            # Fallback 1: btn-success with data-ftype=mp4 directly
             if not best_btn:
-                print(f"    Trying fallback button search...")
-                all_btns = await page.query_selector_all("button.btn-success, button.btn-primary, a.btn-success")
-                for b in all_btns:
-                    text = (await b.inner_text()).strip().lower()
-                    parent_text = ""
-                    try:
-                        parent = await b.evaluate_handle("el => el.closest('tr') || el.closest('div')")
-                        parent_text = await page.evaluate("el => el ? el.innerText : ''", parent)
-                    except:
-                        pass
-                    combined = (text + " " + parent_text).lower()
-                    for q in ["2160", "1440", "1080", "720", "480", "360"]:
-                        if q in combined and int(q) > best_quality:
-                            best_quality = int(q)
-                            best_btn = b
-                            print(f"    Found quality {q}p via text search")
-                            break
+                print(f"    Fallback 1: button.btn-success[data-ftype=mp4]")
+                loc = page.locator('button.btn-success[data-ftype="mp4"]')
+                c = await loc.count()
+                print(f"    Count: {c}")
+                if c > 0:
+                    best_btn = loc.first
 
-            # Absolute last resort: click 3rd download button (as per your original steps)
+            # Fallback 2: all btn-success, log each row, pick first video one
             if not best_btn:
-                print(f"    Clicking 3rd option as last resort...")
+                print(f"    Fallback 2: scanning all btn-success buttons...")
                 all_btns = await page.query_selector_all("button.btn-success")
+                print(f"    Total btn-success: {len(all_btns)}")
+                for i, b in enumerate(all_btns):
+                    row_text = await page.evaluate(
+                        "el => { const r = el.closest('tr') || el.closest('div'); return r ? r.innerText.trim() : ''; }",
+                        b
+                    )
+                    print(f"      btn[{i}] row: {row_text[:60]}")
+                    has_quality = any(q in row_text for q in ['1080','720','480','360','2160','1440'])
+                    has_mp4 = 'mp4' in row_text.lower()
+                    if has_quality or has_mp4:
+                        best_btn = page.locator(f"button.btn-success >> nth={i}")
+                        print(f"    Selected btn[{i}] as best video button")
+                        break
+
+            # Fallback 3: 3rd button (skip 2 audio buttons = mp3 128k + 320k)
+            if not best_btn:
+                print(f"    Fallback 3: using nth=2 (skip 2 audio buttons)...")
+                all_btns = await page.query_selector_all("button.btn-success")
+                print(f"    Total buttons: {len(all_btns)}")
                 if len(all_btns) >= 3:
-                    best_btn = all_btns[2]  # 3rd button = 1080p per your observation
+                    best_btn = page.locator("button.btn-success >> nth=2")
+                    print(f"    Using 3rd button as 1080p (confirmed from manual inspection)")
                 elif len(all_btns) > 0:
-                    best_btn = all_btns[0]
+                    best_btn = page.locator("button.btn-success >> nth=0")
 
             if not best_btn:
-                raise Exception("No download quality buttons found")
+                await page.screenshot(path=f"{DOWNLOADS_DIR}/debug_{video_id}_nobtns.png", full_page=True)
+                raise Exception("No download quality buttons found after all fallbacks")
+
 
             # ── Step 5: Click best quality button and handle download popup ──
             print(f"  📥 Clicking download button...")
