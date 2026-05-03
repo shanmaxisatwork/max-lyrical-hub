@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-STEP 2: Download videos using Invidious API
-- No browser, no Playwright, no Cloudflare issues
-- Uses 15+ public Invidious instances with auto-fallback
-- Gets direct MP4 download URL for best quality (1080p → 720p → best)
-- Downloads video + audio streams and merges with FFmpeg if needed
-- Downloads original thumbnail
+STEP 2: Download videos using yt-dlp
+- Talks directly to YouTube internal API — no middleman site
+- No Cloudflare, no IP blocks, works perfectly on GitHub Actions
+- Downloads best quality (1080p video + best audio, auto-merged)
+- Extracts original thumbnail automatically
 - Sends Telegram status at every step
 """
 
@@ -13,7 +12,7 @@ import os
 import json
 import time
 import requests
-import subprocess
+import yt_dlp
 from pathlib import Path
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -22,33 +21,14 @@ TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 QUEUE_FILE         = "state/download_queue.json"
 DOWNLOADS_DIR      = "downloads"
 
-# 15+ public Invidious instances — tried in order, auto-fallback if one fails
-INVIDIOUS_INSTANCES = [
-    "https://invidious.nerdvpn.de",
-    "https://invidious.privacydev.net",
-    "https://inv.tux.pizza",
-    "https://invidious.fdn.fr",
-    "https://invidious.lunar.icu",
-    "https://invidious.dhusch.de",
-    "https://vid.puffyan.us",
-    "https://yt.cdaut.de",
-    "https://invidious.osi.kr",
-    "https://invidious.io.lol",
-    "https://invidious.protokolla.fi",
-    "https://iv.melmac.space",
-    "https://invidious.perennialte.ch",
-    "https://yt.artemislena.eu",
-    "https://invidious.flokinet.to",
-]
-
-QUALITY_PRIORITY = ["1080", "720", "480", "360"]
-
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    clean = msg.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": clean}, timeout=10)
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+        }, timeout=10)
     except Exception as e:
         print(f"  [TELEGRAM ERROR] {e}")
 
@@ -64,36 +44,6 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
-def download_file(url, output_path, desc="file", timeout=600):
-    """Stream-download a file with progress logging every 25%."""
-    print(f"  downloading {desc}...")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.youtube.com/",
-    }
-    try:
-        with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
-            r.raise_for_status()
-            total      = int(r.headers.get("content-length", 0))
-            downloaded = 0
-            last_log   = 0
-            with open(output_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = (downloaded / total) * 100
-                            if pct - last_log >= 25:
-                                print(f"     {pct:.0f}% — {downloaded//1024//1024}MB / {total//1024//1024}MB")
-                                last_log = pct
-        size_mb = os.path.getsize(output_path) / (1024*1024)
-        print(f"  saved: {size_mb:.1f} MB")
-        return True
-    except Exception as e:
-        print(f"  download_file failed: {e}")
-        return False
-
 def download_thumbnail(url, video_id):
     if not url:
         return None
@@ -103,178 +53,93 @@ def download_thumbnail(url, video_id):
             path = f"{DOWNLOADS_DIR}/{video_id}_thumbnail.jpg"
             with open(path, "wb") as f:
                 f.write(r.content)
-            print(f"  thumbnail saved")
+            print(f"  thumbnail saved: {path}")
             return path
     except Exception as e:
         print(f"  thumbnail failed: {e}")
     return None
 
-# ─── INVIDIOUS API ────────────────────────────────────────────────────────────
-def get_video_info(video_id):
-    """Try each Invidious instance until one works."""
-    for instance in INVIDIOUS_INSTANCES:
-        url = f"{instance}/api/v1/videos/{video_id}"
-        try:
-            print(f"  trying {instance} ...")
-            r = requests.get(url, timeout=15, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"
-            })
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("formatStreams") or data.get("adaptiveFormats"):
-                    print(f"  got video info!")
-                    return instance, data
-                else:
-                    print(f"  empty formats from {instance}")
-            else:
-                print(f"  HTTP {r.status_code} from {instance}")
-        except requests.Timeout:
-            print(f"  timeout: {instance}")
-        except Exception as e:
-            print(f"  error {instance}: {str(e)[:60]}")
-        time.sleep(0.5)
-    return None, None
-
-def pick_best_stream(video_data, instance_url):
-    """
-    Pick best quality stream.
-    adaptiveFormats = separate video+audio (up to 1080p) — need FFmpeg merge
-    formatStreams   = combined video+audio (up to 720p)   — direct download
-    """
-    format_streams   = video_data.get("formatStreams", [])
-    adaptive_formats = video_data.get("adaptiveFormats", [])
-
-    def res_key(s):
-        try:
-            return int(s.get("qualityLabel","0p").replace("p","").split("s")[0])
-        except:
-            return 0
-
-    def fix_url(url):
-        if url and url.startswith("/"):
-            return instance_url + url
-        return url
-
-    # Try adaptive (1080p possible)
-    video_streams = sorted(
-        [f for f in adaptive_formats if f.get("type","").startswith("video/mp4") and f.get("url")],
-        key=res_key, reverse=True
-    )
-    audio_streams = sorted(
-        [f for f in adaptive_formats if f.get("type","").startswith("audio/") and f.get("url")],
-        key=lambda s: int(s.get("bitrate",0)), reverse=True
-    )
-
-    print(f"\n  adaptive video streams: {len(video_streams)}")
-    for s in video_streams[:5]:
-        print(f"    {s.get('qualityLabel','?')} | {s.get('type','?')[:40]}")
-    print(f"  audio streams: {len(audio_streams)}")
-
-    # Pick best video matching quality priority
-    best_video = None
-    for q in QUALITY_PRIORITY:
-        for s in video_streams:
-            if q in s.get("qualityLabel",""):
-                best_video = s
-                break
-        if best_video:
-            break
-    if not best_video and video_streams:
-        best_video = video_streams[0]
-
-    best_audio = audio_streams[0] if audio_streams else None
-
-    if best_video and best_audio:
-        best_video["url"] = fix_url(best_video["url"])
-        best_audio["url"] = fix_url(best_audio["url"])
-        print(f"  selected: {best_video.get('qualityLabel')} adaptive + audio")
-        return "adaptive", best_video, best_audio
-
-    # Fall back to combined formatStreams
-    print(f"  no adaptive, trying combined streams...")
-    combined = sorted(
-        [f for f in format_streams if f.get("url")],
-        key=res_key, reverse=True
-    )
-    print(f"  combined streams: {len(combined)}")
-    for s in combined:
-        print(f"    {s.get('qualityLabel','?')} | {s.get('type','?')[:40]}")
-
-    if combined:
-        best = combined[0]
-        best["url"] = fix_url(best["url"])
-        print(f"  selected: {best.get('qualityLabel')} combined")
-        return "combined", best, None
-
-    return None, None, None
-
-def merge_video_audio(video_path, audio_path, output_path):
-    """Merge video + audio with FFmpeg."""
-    print(f"  merging with FFmpeg...")
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-strict", "experimental",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"FFmpeg merge failed: {result.stderr[-200:]}")
-    size = os.path.getsize(output_path) / (1024*1024)
-    print(f"  merged! {size:.1f} MB")
-
+# ─── YT-DLP DOWNLOADER ────────────────────────────────────────────────────────
 def download_video(video_id, title):
-    """Full download flow: info → best stream → download → merge if needed."""
+    """
+    Download YouTube video using yt-dlp.
+    - Best video (max 1080p) + best audio, auto-merged into MP4
+    - No cookies, no login, no third-party site
+    - Works directly with YouTube's internal API
+    """
     Path(DOWNLOADS_DIR).mkdir(exist_ok=True)
-    safe = "".join(c for c in title if c.isalnum() or c in " -_")[:50].strip()
-    final = f"{DOWNLOADS_DIR}/{video_id}_{safe}.mp4"
+    safe  = "".join(c for c in title if c.isalnum() or c in " -_")[:50].strip()
+    out   = f"{DOWNLOADS_DIR}/{video_id}_{safe}.mp4"
+    url   = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Get info
-    instance, data = get_video_info(video_id)
-    if not data:
-        raise Exception("All 15 Invidious instances failed — try again later")
+    # Progress hook — logs every 25%
+    last_pct = {"v": 0}
+    def progress_hook(d):
+        if d["status"] == "downloading":
+            total   = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            dled    = d.get("downloaded_bytes", 0)
+            if total > 0:
+                pct = (dled / total) * 100
+                if pct - last_pct["v"] >= 25:
+                    print(f"     {pct:.0f}% — {dled//1024//1024}MB / {total//1024//1024}MB")
+                    last_pct["v"] = pct
+        elif d["status"] == "finished":
+            print(f"  download finished, merging streams...")
 
-    # Pick stream
-    stream_type, vid_stream, aud_stream = pick_best_stream(data, instance)
-    if not stream_type:
-        raise Exception("No downloadable streams in Invidious response")
+    ydl_opts = {
+        # Best video (up to 1080p) + best audio → merged into single mp4
+        "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+        "outtmpl": out,
+        "merge_output_format": "mp4",
+        "progress_hooks": [progress_hook],
 
-    if stream_type == "adaptive":
-        vpath = f"{DOWNLOADS_DIR}/{video_id}_v.mp4"
-        apath = f"{DOWNLOADS_DIR}/{video_id}_a.m4a"
-        quality = vid_stream.get("qualityLabel","?")
-        print(f"\n  downloading {quality} video stream...")
-        if not download_file(vid_stream["url"], vpath, f"{quality} video"):
-            raise Exception("Video stream download failed")
-        print(f"  downloading audio stream...")
-        if not download_file(aud_stream["url"], apath, "audio"):
-            raise Exception("Audio stream download failed")
-        merge_video_audio(vpath, apath, final)
-        for f in [vpath, apath]:
-            try: os.remove(f)
-            except: pass
-    else:
-        quality = vid_stream.get("qualityLabel","?")
-        print(f"\n  downloading {quality} combined stream...")
-        if not download_file(vid_stream["url"], final, f"{quality} video"):
-            raise Exception("Combined stream download failed")
+        # Speed + reliability settings
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
 
-    if not os.path.exists(final):
-        raise Exception("Output file missing after download")
+        # Avoid bot detection
+        "sleep_interval": 1,
+        "max_sleep_interval": 3,
 
-    size = os.path.getsize(final) / (1024*1024)
+        # No extra files
+        "noplaylist": True,
+        "no_warnings": False,
+        "quiet": False,
+        "noprogress": False,
+
+        # FFmpeg for merging
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
+    }
+
+    print(f"  yt-dlp downloading: {url}")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    # yt-dlp sometimes adds .mp4.mp4 — find the actual output file
+    if not os.path.exists(out):
+        # Search for the file
+        candidates = list(Path(DOWNLOADS_DIR).glob(f"{video_id}*.mp4"))
+        if candidates:
+            actual = str(candidates[0])
+            print(f"  file found at: {actual}")
+            return actual
+        raise Exception("Output file not found after yt-dlp download")
+
+    size = os.path.getsize(out) / (1024 * 1024)
     if size < 1:
-        raise Exception(f"Output file too small: {size:.1f}MB")
+        raise Exception(f"Output file too small: {size:.1f}MB — download likely failed")
 
-    return final
+    print(f"  SUCCESS: {size:.1f} MB → {out}")
+    return out
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     print(f"\n{'='*60}")
-    print(f"MAX LYRICAL HUB — Downloader (Invidious API, no browser)")
+    print(f"MAX LYRICAL HUB — Downloader (yt-dlp)")
     print(f"{'='*60}\n")
 
     queue       = load_json(QUEUE_FILE, [])
@@ -285,8 +150,12 @@ def main():
         telegram("Downloader: No videos queued — skipping.")
         return
 
-    print(f"{len(to_download)} video(s) to download")
-    telegram(f"Download Started!\n{len(to_download)} video(s) via Invidious API (no browser needed)...")
+    print(f"{len(to_download)} video(s) to download\n")
+    telegram(
+        f"Download Started!\n"
+        f"{len(to_download)} video(s) via yt-dlp\n"
+        f"Downloading directly from YouTube..."
+    )
 
     for v in to_download:
         vid_id = v["id"]
@@ -295,20 +164,21 @@ def main():
 
         print(f"\n{'─'*50}")
         print(f"Downloading: {title[:70]}")
-        print(f"Duration: {mins}m | Views: {v.get('views',0):,}")
+        print(f"Duration: {mins}m | Views: {v.get('views', 0):,}")
 
         telegram(
             f"Downloading #{v.get('rank','?')}\n"
             f"{title[:60]}\n"
             f"{mins} min | {v.get('views',0):,} views\n"
-            f"Fetching from Invidious..."
+            f"Starting yt-dlp..."
         )
 
-        thumb_path = download_thumbnail(v.get("thumbnail_url",""), vid_id)
+        # Download thumbnail from YouTube directly
+        thumb_path = download_thumbnail(v.get("thumbnail_url", ""), vid_id)
 
         try:
             video_path = download_video(vid_id, title)
-            file_size  = os.path.getsize(video_path) / (1024*1024)
+            file_size  = os.path.getsize(video_path) / (1024 * 1024)
 
             for item in queue:
                 if item["id"] == vid_id:
@@ -339,15 +209,23 @@ def main():
                     break
 
             save_json(QUEUE_FILE, queue)
-            telegram(f"Download FAILED\n{title[:50]}\nError: {err[:150]}")
+            telegram(
+                f"Download FAILED\n"
+                f"{title[:50]}\n"
+                f"Error: {err[:150]}"
+            )
 
-        time.sleep(3)
+        time.sleep(2)
 
     done   = sum(1 for v in queue if v.get("status") == "downloaded")
     failed = sum(1 for v in to_download if v.get("status") == "download_failed")
 
-    print(f"\nDownload phase done: {done} success, {failed} failed")
-    telegram(f"Download Phase Done!\nSuccess: {done} | Failed: {failed}\nNext: Watermark processing...")
+    print(f"\nDone: {done} success, {failed} failed")
+    telegram(
+        f"Download Phase Done!\n"
+        f"Success: {done} | Failed: {failed}\n"
+        f"Next: Watermark processing..."
+    )
 
 if __name__ == "__main__":
     main()
