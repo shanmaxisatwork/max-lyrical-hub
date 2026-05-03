@@ -1,40 +1,54 @@
 #!/usr/bin/env python3
 """
-STEP 2: Download videos using Playwright on yt5s.biz
-- Opens real Chromium browser (headless)
-- Navigates yt5s.biz like a human
-- Handles Cloudflare delay
-- Selects best quality (1080p or highest available)
-- Downloads video file
-- Sends Telegram status at each stage
+STEP 2: Download videos using Invidious API
+- No browser, no Playwright, no Cloudflare issues
+- Uses 15+ public Invidious instances with auto-fallback
+- Gets direct MP4 download URL for best quality (1080p → 720p → best)
+- Downloads video + audio streams and merges with FFmpeg if needed
+- Downloads original thumbnail
+- Sends Telegram status at every step
 """
 
 import os
 import json
 import time
-import shutil
-import asyncio
 import requests
+import subprocess
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 QUEUE_FILE         = "state/download_queue.json"
 DOWNLOADS_DIR      = "downloads"
-SITE_URL           = "https://yt5s.biz"
+
+# 15+ public Invidious instances — tried in order, auto-fallback if one fails
+INVIDIOUS_INSTANCES = [
+    "https://invidious.nerdvpn.de",
+    "https://invidious.privacydev.net",
+    "https://inv.tux.pizza",
+    "https://invidious.fdn.fr",
+    "https://invidious.lunar.icu",
+    "https://invidious.dhusch.de",
+    "https://vid.puffyan.us",
+    "https://yt.cdaut.de",
+    "https://invidious.osi.kr",
+    "https://invidious.io.lol",
+    "https://invidious.protokolla.fi",
+    "https://iv.melmac.space",
+    "https://invidious.perennialte.ch",
+    "https://yt.artemislena.eu",
+    "https://invidious.flokinet.to",
+]
+
+QUALITY_PRIORITY = ["1080", "720", "480", "360"]
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def telegram(msg):
-    """Send plain text Telegram message - safe for Malayalam/special chars."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     clean = msg.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
     try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": clean,
-        }, timeout=10)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": clean}, timeout=10)
     except Exception as e:
         print(f"  [TELEGRAM ERROR] {e}")
 
@@ -50,395 +64,290 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
+def download_file(url, output_path, desc="file", timeout=600):
+    """Stream-download a file with progress logging every 25%."""
+    print(f"  downloading {desc}...")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.youtube.com/",
+    }
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            total      = int(r.headers.get("content-length", 0))
+            downloaded = 0
+            last_log   = 0
+            with open(output_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = (downloaded / total) * 100
+                            if pct - last_log >= 25:
+                                print(f"     {pct:.0f}% — {downloaded//1024//1024}MB / {total//1024//1024}MB")
+                                last_log = pct
+        size_mb = os.path.getsize(output_path) / (1024*1024)
+        print(f"  saved: {size_mb:.1f} MB")
+        return True
+    except Exception as e:
+        print(f"  download_file failed: {e}")
+        return False
+
 def download_thumbnail(url, video_id):
-    """Download the original video's thumbnail."""
     if not url:
         return None
     try:
         r = requests.get(url, timeout=15)
         if r.status_code == 200:
-            thumb_path = f"{DOWNLOADS_DIR}/{video_id}_thumbnail.jpg"
-            with open(thumb_path, "wb") as f:
+            path = f"{DOWNLOADS_DIR}/{video_id}_thumbnail.jpg"
+            with open(path, "wb") as f:
                 f.write(r.content)
-            print(f"  ✅ Thumbnail downloaded: {thumb_path}")
-            return thumb_path
+            print(f"  thumbnail saved")
+            return path
     except Exception as e:
-        print(f"  [WARN] Thumbnail download failed: {e}")
+        print(f"  thumbnail failed: {e}")
     return None
 
-# ─── PLAYWRIGHT DOWNLOADER ────────────────────────────────────────────────────
-async def download_video_playwright(yt_url, video_id, title):
-    """
-    Opens yt5s.biz in headless Chromium, pastes URL,
-    waits for processing, clicks best quality download button.
-    """
-    Path(DOWNLOADS_DIR).mkdir(exist_ok=True)
-    output_path = None
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-extensions",
-            ]
-        )
-
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            accept_downloads=True,
-        )
-
-        page = await context.new_page()
-
-        # Remove webdriver detection
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {} };
-        """)
-
+# ─── INVIDIOUS API ────────────────────────────────────────────────────────────
+def get_video_info(video_id):
+    """Try each Invidious instance until one works."""
+    for instance in INVIDIOUS_INSTANCES:
+        url = f"{instance}/api/v1/videos/{video_id}"
         try:
-            print(f"  🌐 Opening {SITE_URL}...")
-            await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2000)
-
-            # ── Step 1: Find the URL input and paste YouTube link ──
-            print(f"  📋 Pasting URL: {yt_url}")
-
-            # Try multiple possible input selectors
-            input_selectors = [
-                "input[name='query']",
-                "input[type='text']",
-                "input[placeholder*='youtube']",
-                "input[placeholder*='YouTube']",
-                "input[placeholder*='link']",
-                "input[placeholder*='URL']",
-                "#query",
-                ".search-input",
-            ]
-
-            input_el = None
-            for sel in input_selectors:
-                try:
-                    el = page.locator(sel).first
-                    if await el.is_visible(timeout=3000):
-                        input_el = el
-                        print(f"    Found input with selector: {sel}")
-                        break
-                except:
-                    continue
-
-            if not input_el:
-                # Fallback: find any visible text input
-                inputs = await page.query_selector_all("input")
-                for inp in inputs:
-                    if await inp.is_visible():
-                        input_type = await inp.get_attribute("type") or "text"
-                        if input_type in ("text", "url", "search", ""):
-                            input_el = page.locator(f"input >> nth={inputs.index(inp)}")
-                            print(f"    Found input via fallback scan")
-                            break
-
-            if not input_el:
-                raise Exception("Could not find URL input field on page")
-
-            await input_el.click()
-            await input_el.fill("")
-            await page.wait_for_timeout(500)
-            await input_el.type(yt_url, delay=50)  # Type like a human
-            await page.wait_for_timeout(500)
-
-            # ── Step 2: Click the Download/Search button ──
-            print(f"  🖱️  Clicking download button...")
-            btn_selectors = [
-                "button[type='submit']",
-                "button.btn-success",
-                "button.btn-primary",
-                "input[type='submit']",
-                "button:has-text('Download')",
-                "button:has-text('Start')",
-                "button:has-text('Convert')",
-                "button:has-text('Go')",
-                "#btn-submit",
-                ".btn-download",
-            ]
-
-            clicked = False
-            for sel in btn_selectors:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.is_visible(timeout=2000):
-                        await btn.click()
-                        clicked = True
-                        print(f"    Clicked button: {sel}")
-                        break
-                except:
-                    continue
-
-            if not clicked:
-                # Try pressing Enter on the input
-                await input_el.press("Enter")
-                print(f"    Pressed Enter as fallback")
-
-            # ── Step 3: Wait for Cloudflare check + processing (18-25 seconds) ──
-            print(f"  ⏳ Waiting for Cloudflare check + processing (25 seconds)...")
-            await page.wait_for_timeout(25000)
-
-            # Wait for download buttons to appear
-            # Look for quality buttons - specifically 1080p or best available
-            print(f"  🔍 Looking for quality/download buttons...")
-            await page.wait_for_timeout(3000)
-
-            # ── Step 4: Select best quality MP4 button ──
-            # CONFIRMED from HTML inspection:
-            # - Buttons: button.btn.w-100.btn-success with data-ftype="mp4"
-            # - data-fquality is INTERNAL CODEC ID (not resolution number!)
-            # - Quality text "1080p" is in the PARENT <tr> row text, not the button
-            # Strategy: use JS to scan all mp4 buttons, read parent row for quality label
-
-            best_btn = None
-
-            print(f"    Scanning MP4 buttons via JS parent-row quality detection...")
-
-            # JS: find index of best quality mp4 button by reading parent row text
-            js_code = """() => {
-                const qualityOrder = ['2160', '1440', '1080', '720', '480', '360'];
-                const buttons = Array.from(document.querySelectorAll('button[data-ftype="mp4"]'));
-                console.log('mp4 buttons found: ' + buttons.length);
-                if (buttons.length === 0) return {idx: -1, quality: 'none', total: 0};
-
-                let bestIdx = 0;
-                let bestRank = 999;
-
-                buttons.forEach((btn, i) => {
-                    const row = btn.closest('tr') || btn.closest('div') || btn.parentElement;
-                    const txt = row ? row.innerText : '';
-                    for (let r = 0; r < qualityOrder.length; r++) {
-                        if (txt.includes(qualityOrder[r] + 'p')) {
-                            if (r < bestRank) {
-                                bestRank = r;
-                                bestIdx = i;
-                            }
-                            break;
-                        }
-                    }
-                });
-
-                const chosenRow = buttons[bestIdx].closest('tr') || buttons[bestIdx].parentElement;
-                return {
-                    idx: bestIdx,
-                    quality: chosenRow ? chosenRow.innerText.substring(0,40) : 'unknown',
-                    total: buttons.length
-                };
-            }"""
-
-            result = await page.evaluate(js_code)
-            print(f"    JS result: {result}")
-
-            if result and result.get('total', 0) > 0:
-                idx = result.get('idx', 0)
-                quality_label = result.get('quality', '?')
-                all_mp4 = page.locator('button[data-ftype="mp4"]')
-                total = await all_mp4.count()
-                idx = min(idx, total - 1)
-                best_btn = all_mp4.nth(idx)
-                print(f"    Selected MP4 button #{idx} | Row: {quality_label[:40]}")
-
-            # Fallback 1: btn-success with data-ftype=mp4 directly
-            if not best_btn:
-                print(f"    Fallback 1: button.btn-success[data-ftype=mp4]")
-                loc = page.locator('button.btn-success[data-ftype="mp4"]')
-                c = await loc.count()
-                print(f"    Count: {c}")
-                if c > 0:
-                    best_btn = loc.first
-
-            # Fallback 2: all btn-success, log each row, pick first video one
-            if not best_btn:
-                print(f"    Fallback 2: scanning all btn-success buttons...")
-                all_btns = await page.query_selector_all("button.btn-success")
-                print(f"    Total btn-success: {len(all_btns)}")
-                for i, b in enumerate(all_btns):
-                    row_text = await page.evaluate(
-                        "el => { const r = el.closest('tr') || el.closest('div'); return r ? r.innerText.trim() : ''; }",
-                        b
-                    )
-                    print(f"      btn[{i}] row: {row_text[:60]}")
-                    has_quality = any(q in row_text for q in ['1080','720','480','360','2160','1440'])
-                    has_mp4 = 'mp4' in row_text.lower()
-                    if has_quality or has_mp4:
-                        best_btn = page.locator(f"button.btn-success >> nth={i}")
-                        print(f"    Selected btn[{i}] as best video button")
-                        break
-
-            # Fallback 3: 3rd button (skip 2 audio buttons = mp3 128k + 320k)
-            if not best_btn:
-                print(f"    Fallback 3: using nth=2 (skip 2 audio buttons)...")
-                all_btns = await page.query_selector_all("button.btn-success")
-                print(f"    Total buttons: {len(all_btns)}")
-                if len(all_btns) >= 3:
-                    best_btn = page.locator("button.btn-success >> nth=2")
-                    print(f"    Using 3rd button as 1080p (confirmed from manual inspection)")
-                elif len(all_btns) > 0:
-                    best_btn = page.locator("button.btn-success >> nth=0")
-
-            if not best_btn:
-                await page.screenshot(path=f"{DOWNLOADS_DIR}/debug_{video_id}_nobtns.png", full_page=True)
-                raise Exception("No download quality buttons found after all fallbacks")
-
-
-            # ── Step 5: Click best quality button and handle download popup ──
-            print(f"  📥 Clicking download button...")
-
-            # Set up download listener BEFORE clicking
-            async with page.expect_download(timeout=60000) as download_info:
-                await best_btn.click()
-                await page.wait_for_timeout(2000)
-
-                # Handle possible "Download NOW" popup
-                popup_selectors = [
-                    "button:has-text('Download NOW')",
-                    "button:has-text('Download Now')",
-                    "a:has-text('Download NOW')",
-                    "a:has-text('Download Now')",
-                    ".btn-success:has-text('Download')",
-                ]
-                for sel in popup_selectors:
-                    try:
-                        popup_btn = page.locator(sel).first
-                        if await popup_btn.is_visible(timeout=3000):
-                            print(f"    Clicking popup: {sel}")
-                            await popup_btn.click()
-                            break
-                    except:
-                        continue
-
-                download = await download_info.value
-
-            # ── Step 6: Save the file ──
-            safe_title = "".join(c for c in title if c.isalnum() or c in " -_")[:50]
-            output_path = f"{DOWNLOADS_DIR}/{video_id}_{safe_title}.mp4"
-            await download.save_as(output_path)
-            print(f"  ✅ Downloaded to: {output_path}")
-            file_size = os.path.getsize(output_path) / (1024*1024)
-            print(f"     Size: {file_size:.1f} MB")
-
-        except PlaywrightTimeout as e:
-            print(f"  ❌ Playwright timeout: {e}")
-            # Take screenshot for debugging
-            try:
-                await page.screenshot(path=f"{DOWNLOADS_DIR}/error_{video_id}.png")
-                print(f"  📸 Screenshot saved for debugging")
-            except:
-                pass
-            raise
-
+            print(f"  trying {instance} ...")
+            r = requests.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"
+            })
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("formatStreams") or data.get("adaptiveFormats"):
+                    print(f"  got video info!")
+                    return instance, data
+                else:
+                    print(f"  empty formats from {instance}")
+            else:
+                print(f"  HTTP {r.status_code} from {instance}")
+        except requests.Timeout:
+            print(f"  timeout: {instance}")
         except Exception as e:
-            print(f"  ❌ Download error: {e}")
-            try:
-                await page.screenshot(path=f"{DOWNLOADS_DIR}/error_{video_id}.png")
-            except:
-                pass
-            raise
+            print(f"  error {instance}: {str(e)[:60]}")
+        time.sleep(0.5)
+    return None, None
 
-        finally:
-            await browser.close()
+def pick_best_stream(video_data, instance_url):
+    """
+    Pick best quality stream.
+    adaptiveFormats = separate video+audio (up to 1080p) — need FFmpeg merge
+    formatStreams   = combined video+audio (up to 720p)   — direct download
+    """
+    format_streams   = video_data.get("formatStreams", [])
+    adaptive_formats = video_data.get("adaptiveFormats", [])
 
-    return output_path
+    def res_key(s):
+        try:
+            return int(s.get("qualityLabel","0p").replace("p","").split("s")[0])
+        except:
+            return 0
+
+    def fix_url(url):
+        if url and url.startswith("/"):
+            return instance_url + url
+        return url
+
+    # Try adaptive (1080p possible)
+    video_streams = sorted(
+        [f for f in adaptive_formats if f.get("type","").startswith("video/mp4") and f.get("url")],
+        key=res_key, reverse=True
+    )
+    audio_streams = sorted(
+        [f for f in adaptive_formats if f.get("type","").startswith("audio/") and f.get("url")],
+        key=lambda s: int(s.get("bitrate",0)), reverse=True
+    )
+
+    print(f"\n  adaptive video streams: {len(video_streams)}")
+    for s in video_streams[:5]:
+        print(f"    {s.get('qualityLabel','?')} | {s.get('type','?')[:40]}")
+    print(f"  audio streams: {len(audio_streams)}")
+
+    # Pick best video matching quality priority
+    best_video = None
+    for q in QUALITY_PRIORITY:
+        for s in video_streams:
+            if q in s.get("qualityLabel",""):
+                best_video = s
+                break
+        if best_video:
+            break
+    if not best_video and video_streams:
+        best_video = video_streams[0]
+
+    best_audio = audio_streams[0] if audio_streams else None
+
+    if best_video and best_audio:
+        best_video["url"] = fix_url(best_video["url"])
+        best_audio["url"] = fix_url(best_audio["url"])
+        print(f"  selected: {best_video.get('qualityLabel')} adaptive + audio")
+        return "adaptive", best_video, best_audio
+
+    # Fall back to combined formatStreams
+    print(f"  no adaptive, trying combined streams...")
+    combined = sorted(
+        [f for f in format_streams if f.get("url")],
+        key=res_key, reverse=True
+    )
+    print(f"  combined streams: {len(combined)}")
+    for s in combined:
+        print(f"    {s.get('qualityLabel','?')} | {s.get('type','?')[:40]}")
+
+    if combined:
+        best = combined[0]
+        best["url"] = fix_url(best["url"])
+        print(f"  selected: {best.get('qualityLabel')} combined")
+        return "combined", best, None
+
+    return None, None, None
+
+def merge_video_audio(video_path, audio_path, output_path):
+    """Merge video + audio with FFmpeg."""
+    print(f"  merging with FFmpeg...")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-strict", "experimental",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg merge failed: {result.stderr[-200:]}")
+    size = os.path.getsize(output_path) / (1024*1024)
+    print(f"  merged! {size:.1f} MB")
+
+def download_video(video_id, title):
+    """Full download flow: info → best stream → download → merge if needed."""
+    Path(DOWNLOADS_DIR).mkdir(exist_ok=True)
+    safe = "".join(c for c in title if c.isalnum() or c in " -_")[:50].strip()
+    final = f"{DOWNLOADS_DIR}/{video_id}_{safe}.mp4"
+
+    # Get info
+    instance, data = get_video_info(video_id)
+    if not data:
+        raise Exception("All 15 Invidious instances failed — try again later")
+
+    # Pick stream
+    stream_type, vid_stream, aud_stream = pick_best_stream(data, instance)
+    if not stream_type:
+        raise Exception("No downloadable streams in Invidious response")
+
+    if stream_type == "adaptive":
+        vpath = f"{DOWNLOADS_DIR}/{video_id}_v.mp4"
+        apath = f"{DOWNLOADS_DIR}/{video_id}_a.m4a"
+        quality = vid_stream.get("qualityLabel","?")
+        print(f"\n  downloading {quality} video stream...")
+        if not download_file(vid_stream["url"], vpath, f"{quality} video"):
+            raise Exception("Video stream download failed")
+        print(f"  downloading audio stream...")
+        if not download_file(aud_stream["url"], apath, "audio"):
+            raise Exception("Audio stream download failed")
+        merge_video_audio(vpath, apath, final)
+        for f in [vpath, apath]:
+            try: os.remove(f)
+            except: pass
+    else:
+        quality = vid_stream.get("qualityLabel","?")
+        print(f"\n  downloading {quality} combined stream...")
+        if not download_file(vid_stream["url"], final, f"{quality} video"):
+            raise Exception("Combined stream download failed")
+
+    if not os.path.exists(final):
+        raise Exception("Output file missing after download")
+
+    size = os.path.getsize(final) / (1024*1024)
+    if size < 1:
+        raise Exception(f"Output file too small: {size:.1f}MB")
+
+    return final
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
-async def main():
+def main():
     print(f"\n{'='*60}")
-    print(f"MAX LYRICAL HUB — Video Downloader")
+    print(f"MAX LYRICAL HUB — Downloader (Invidious API, no browser)")
     print(f"{'='*60}\n")
 
-    queue = load_json(QUEUE_FILE, [])
+    queue       = load_json(QUEUE_FILE, [])
     to_download = [v for v in queue if v.get("status") == "queued"]
 
     if not to_download:
-        print("📭 No videos in queue to download.")
-        telegram("📭 <b>Downloader:</b> No videos in queue — skipping.")
+        print("no videos in queue.")
+        telegram("Downloader: No videos queued — skipping.")
         return
 
-    print(f"📋 {len(to_download)} video(s) to download\n")
-    telegram(f"⬇️ <b>Download Started!</b>\n📋 {len(to_download)} video(s) to process...")
+    print(f"{len(to_download)} video(s) to download")
+    telegram(f"Download Started!\n{len(to_download)} video(s) via Invidious API (no browser needed)...")
 
     for v in to_download:
-        vid_id    = v["id"]
-        yt_url    = v["url"]
-        title     = v["title"]
-        mins      = v.get("duration_s", 0) // 60
+        vid_id = v["id"]
+        title  = v["title"]
+        mins   = v.get("duration_s", 0) // 60
 
         print(f"\n{'─'*50}")
-        print(f"📥 Downloading: {title[:60]}")
-        print(f"   Duration: {mins}m | 👁 {v.get('views',0):,}")
-        print(f"   URL: {yt_url}")
+        print(f"Downloading: {title[:70]}")
+        print(f"Duration: {mins}m | Views: {v.get('views',0):,}")
 
         telegram(
-            f"⬇️ <b>Downloading #{v.get('rank', '?')}</b>\n"
-            f"📹 {title[:60]}\n"
-            f"⏱ {mins} min | 👁 {v.get('views',0):,} views\n"
-            f"🌐 Starting Playwright browser..."
+            f"Downloading #{v.get('rank','?')}\n"
+            f"{title[:60]}\n"
+            f"{mins} min | {v.get('views',0):,} views\n"
+            f"Fetching from Invidious..."
         )
 
-        # Download thumbnail first (fast, direct URL)
-        thumb_path = download_thumbnail(v.get("thumbnail_url", ""), vid_id)
+        thumb_path = download_thumbnail(v.get("thumbnail_url",""), vid_id)
 
-        # Download video via Playwright
         try:
-            video_path = await download_video_playwright(yt_url, vid_id, title)
+            video_path = download_video(vid_id, title)
+            file_size  = os.path.getsize(video_path) / (1024*1024)
 
-            # Update queue status
             for item in queue:
                 if item["id"] == vid_id:
-                    item["status"] = "downloaded"
-                    item["video_path"] = video_path
+                    item["status"]         = "downloaded"
+                    item["video_path"]     = video_path
                     item["thumbnail_path"] = thumb_path
                     break
 
             save_json(QUEUE_FILE, queue)
 
-            file_size = os.path.getsize(video_path) / (1024*1024)
             telegram(
-                f"✅ <b>Download Complete!</b>\n"
-                f"📹 {title[:60]}\n"
-                f"💾 File size: {file_size:.1f} MB\n"
-                f"🖼 Thumbnail: {'✅ Saved' if thumb_path else '❌ Not found'}\n"
-                f"➡️ Next: Adding watermark..."
+                f"Download Complete!\n"
+                f"{title[:60]}\n"
+                f"Size: {file_size:.1f} MB\n"
+                f"Thumbnail: {'saved' if thumb_path else 'not found'}\n"
+                f"Next: Adding watermark..."
             )
-            print(f"  ✅ SUCCESS! {file_size:.1f} MB")
+            print(f"SUCCESS! {file_size:.1f} MB")
 
         except Exception as e:
-            error_msg = str(e)[:200]
-            print(f"  ❌ FAILED: {error_msg}")
+            err = str(e)[:200]
+            print(f"FAILED: {err}")
 
             for item in queue:
                 if item["id"] == vid_id:
                     item["status"] = "download_failed"
-                    item["error"] = error_msg
+                    item["error"]  = err
                     break
 
             save_json(QUEUE_FILE, queue)
-            telegram(
-                f"❌ <b>Download FAILED</b>\n"
-                f"📹 {title[:50]}\n"
-                f"Error: {error_msg[:150]}\n"
-                f"⏭ Skipping to next video..."
-            )
+            telegram(f"Download FAILED\n{title[:50]}\nError: {err[:150]}")
 
-        # Small delay between downloads
-        await asyncio.sleep(5)
+        time.sleep(3)
 
-    downloaded = sum(1 for v in queue if v.get("status") == "downloaded")
-    failed     = sum(1 for v in to_download if v.get("status") == "download_failed")
-    print(f"\n✅ Download phase complete: {downloaded} done, {failed} failed")
+    done   = sum(1 for v in queue if v.get("status") == "downloaded")
+    failed = sum(1 for v in to_download if v.get("status") == "download_failed")
+
+    print(f"\nDownload phase done: {done} success, {failed} failed")
+    telegram(f"Download Phase Done!\nSuccess: {done} | Failed: {failed}\nNext: Watermark processing...")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
